@@ -21,6 +21,8 @@ English, Japanese, Spanish and Arabic, with fine-grained emotion control,
 speaking speed control, pronunciation control (Pinyin / CMU phonemes /
 Japanese Kana), and faster inference than IndexTTS-2.
 
+The WebUI supports [sequential batch generation, text-based audio filenames and ZIP downloads](docs/webui_batch.md), including a UI-only mode for testing without PyTorch.
+
 ---
 
 ## 🗂️ Model Zoo

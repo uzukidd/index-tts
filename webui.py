@@ -3,7 +3,7 @@ import json
 import os
 import sys
 import threading
-import time
+import uuid
 
 import warnings
 
@@ -21,6 +21,7 @@ parser = argparse.ArgumentParser(
     description="IndexTTS WebUI",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
+parser.add_argument("--ui-only", action="store_true", help="Test WebUI without PyTorch or checkpoints; generates silent demo audio only")
 parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
 parser.add_argument("--port", type=int, default=7860, help="Port to run the web UI on")
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on")
@@ -48,10 +49,10 @@ def _require_optional_extra(flag_name, module_name, install_cmd):
             f"Install it with: {install_cmd}"
         )
 
-if cmd_args.accel:
+if cmd_args.accel and not cmd_args.ui_only:
     _require_optional_extra("accel", "flash_attn", "uv sync --extra accel")
 
-if cmd_args.torch_compile:
+if cmd_args.torch_compile and not cmd_args.ui_only:
     _require_optional_extra("torch_compile", "triton", "uv sync --extra torch_compile")
 
 REQUIRED_FILES = {
@@ -70,7 +71,7 @@ MODEL_REPO = {
 }
 required_files = REQUIRED_FILES[cmd_args.version]
 missing = [f for f in required_files if not os.path.exists(os.path.join(cmd_args.model_dir, f))]
-if missing:
+if missing and not cmd_args.ui_only:
     print(
         f"Model directory {cmd_args.model_dir} is incomplete for v{cmd_args.version} "
         f"(missing: {', '.join(missing)}). Downloading {MODEL_REPO[cmd_args.version]}..."
@@ -87,21 +88,25 @@ if missing:
         sys.exit(1)
     print("Model downloaded successfully.")
 
-from indextts.utils.model_download import ensure_config_available
-try:
-    ensure_config_available(cmd_args.model_dir, version=cmd_args.version)
-except Exception as e:
-    print(f"Failed to download config.yaml: {e}")
-    sys.exit(1)
+if not cmd_args.ui_only:
+    from indextts.utils.model_download import ensure_config_available
+    try:
+        ensure_config_available(cmd_args.model_dir, version=cmd_args.version)
+    except Exception as e:
+        print(f"Failed to download config.yaml: {e}")
+        sys.exit(1)
 
 IS_V25 = cmd_args.version == "2.5"
 
 import gradio as gr
 from indextts.utils.examples_downloader import ensure_examples_available
+from indextts.utils.webui_batch import parse_batch_text, run_batch
 from indextts.utils.presets import list_presets, save_preset, load_preset, delete_preset
 from tools.i18n.i18n import I18nAuto
 
-if IS_V25:
+if cmd_args.ui_only:
+    from tools.webui_demo import DemoTTS
+elif IS_V25:
     from indextts.infer_v2_5 import IndexTTS2
 else:
     from indextts.infer_v2 import IndexTTS2
@@ -110,7 +115,8 @@ i18n = I18nAuto(language="Auto")
 MODE = 'local'
 
 # Download example audio files if missing
-ensure_examples_available()
+if not cmd_args.ui_only:
+    ensure_examples_available()
 
 LOW_VRAM_THRESHOLD_GB = 10.0
 
@@ -123,7 +129,7 @@ def detect_vram_gb():
     return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 
 
-_vram_gb = detect_vram_gb()
+_vram_gb = None if cmd_args.ui_only else detect_vram_gb()
 LOW_VRAM = _vram_gb is not None and _vram_gb < LOW_VRAM_THRESHOLD_GB
 
 HALF_PRECISION = cmd_args.fp16 or LOW_VRAM
@@ -141,6 +147,9 @@ if LOW_VRAM:
 
 def build_tts(use_accel=False, use_torch_compile=False):
     """Build an IndexTTS2 instance with the requested acceleration options."""
+    if cmd_args.ui_only:
+        return DemoTTS(cmd_args.version)
+
     import torch
 
     kwargs = dict(
@@ -181,7 +190,7 @@ os.makedirs("prompts",exist_ok=True)
 MAX_LENGTH_TO_USE_SPEED = 70
 example_cases = []
 with open("examples/cases.jsonl", "r", encoding="utf-8") as f:
-    for line in f:
+    for line in ([] if cmd_args.ui_only else f):
         line = line.strip()
         if not line:
             continue
@@ -646,12 +655,15 @@ def gen_single(emo_control_method,prompt, text,
                emo_text,emo_random,
                max_text_tokens_per_segment=120,
                duration_factor=1.0,
-                *args, progress=gr.Progress()):
-    output_path = None
-    if not output_path:
-        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
-    # set gradio progress
-    tts.gr_progress = progress
+                *args, progress=gr.Progress(), output_path=None):
+    if not prompt or not os.path.isfile(prompt):
+        raise gr.Error("Upload a voice reference first / 请先上传音色参考音频")
+    if not text or not text.strip():
+        raise gr.Error("Enter text first / 请先输入文本")
+    if emo_control_method == 1 and (not emo_ref_path or not os.path.isfile(emo_ref_path)):
+        raise gr.Error("Upload an emotion reference / 请上传情感参考音频")
+    if output_path is None:
+        output_path = os.path.join("outputs", f"spk_{uuid.uuid4().hex}.wav")
     do_sample, top_p, top_k, temperature, \
         length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
 
@@ -693,13 +705,52 @@ def gen_single(emo_control_method,prompt, text,
         use_emo_text=(emo_control_method==3), emo_text=emo_text, use_random=emo_random,
         verbose=cmd_args.verbose,
         max_text_tokens_per_segment=int(max_text_tokens_per_segment),
+        stream_return=False,
         **kwargs,
     )
     if IS_V25:
         infer_kwargs["lang"] = lang_choice or "ZH"
         infer_kwargs["duration_factor"] = float(duration_factor)
-    output = tts.infer(**infer_kwargs)
+    # The model caches reference conditioning and exposes a shared progress hook.
+    with mutex:
+        previous_progress = tts.gr_progress
+        try:
+            tts.gr_progress = progress
+            output = tts.infer(**infer_kwargs)
+        finally:
+            tts.gr_progress = previous_progress
+    if output is None or not os.path.isfile(output_path):
+        raise gr.Error("Model did not return audio / 模型未返回音频")
     return gr.update(value=output,visible=True)
+
+
+def gen_batch(emo_control_method, prompt, text, *args, progress=gr.Progress()):
+    if not prompt or not os.path.isfile(prompt):
+        raise gr.Error("Upload a voice reference first / 请先上传音色参考音频")
+    if not parse_batch_text(text):
+        raise gr.Error("Enter at least one task / 请至少输入一条文本")
+    # args begin with language, then emotion audio, mirroring gen_single.
+    if emo_control_method == 1 and (not args[1] or not os.path.isfile(args[1])):
+        raise gr.Error("Upload an emotion reference / 请上传情感参考音频")
+
+    def synthesize(item, path):
+        return gen_single(emo_control_method, prompt, item, *args,
+                          output_path=path, progress=None)
+
+    labels = {
+        "queued": "Queued / 等待中", "running": "Running / 生成中",
+        "completed": "Completed / 已完成", "failed": "Failed / 失败",
+    }
+    for update in run_batch(text, synthesize):
+        done = update.completed + update.failed
+        state = "Running / 正在生成" if update.running else "Finished / 已结束"
+        status = (f"{state}: {done}/{update.total}; "
+                  f"success / 成功 {update.completed}, failed / 失败 {update.failed}")
+        progress(done / update.total, desc=status)
+        rows = [[*row[:3], labels[row[3]], row[4]] for row in update.rows]
+        yield (status, rows, update.files or None, update.archive,
+               update.files[-1] if update.files else None)
+
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
@@ -760,6 +811,9 @@ with gr.Blocks(
     """,
 ) as demo:
     mutex = threading.Lock()
+    if cmd_args.ui_only:
+        gr.Markdown("**UI TEST MODE — silent demo audio only; no model loaded. / "
+                    "界面测试模式：仅输出静音示例，未加载语音模型。**")
     arxiv_id = "2601.03888" if IS_V25 else "2506.21619"
     gr.HTML(f'''
        <h2 style="text-align:center">IndexTTS-{cmd_args.version}</h2>
@@ -834,6 +888,29 @@ with gr.Blocks(
                 output_audio = gr.Audio(
                     label=i18n("生成结果"), visible=True, key="output_audio"
                 )
+
+        with gr.Accordion("Batch generation / 批量生成", open=True):
+            gr.Markdown(
+                "One task per line; blank lines are ignored. Tasks run in order using "
+                "the voice, language, emotion and advanced settings on this page. / "
+                "每行一条任务，忽略空行。按顺序生成，共用本页音色、语言、情感和高级参数。"
+            )
+            input_text_batch = gr.TextArea(
+                label="Batch texts / 批量文本", lines=6,
+                placeholder="你好，欢迎使用。\n这是第二条语音。",
+                elem_id="batch_texts",
+            )
+            batch_button = gr.Button("Generate batch / 开始批量生成", variant="primary", elem_id="batch_generate")
+            batch_status = gr.Textbox(label="Progress / 进度", interactive=False)
+            batch_results = gr.Dataframe(
+                headers=["#", "Text / 文本", "Filename / 文件名", "Status / 状态", "Error / 错误"],
+                datatype=["number", "str", "str", "str", "str"],
+                type="array", interactive=False, wrap=True,
+                elem_id="batch_results",
+            )
+            batch_audio = gr.Audio(label="Latest completed audio / 最近完成的语音", interactive=False)
+            batch_files = gr.File(label="Individual audio downloads / 单条音频下载", file_count="multiple", interactive=False)
+            batch_archive = gr.File(label="Download all (ZIP) / 全部打包下载", interactive=False, elem_id="batch_archive")
 
         with gr.Row():
             experimental_checkbox = gr.Checkbox(label=i18n("显示实验功能"), value=False)
@@ -1376,17 +1453,26 @@ with gr.Blocks(
         outputs=[load_preset_dropdown, manage_preset_dropdown],
     )
 
-    gen_button.click(gen_single,
-                     inputs=[emo_control_method,prompt_audio, input_text_single,
-                            lang_dropdown,
-                            emo_upload, emo_weight,
-                            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-                             emo_text,emo_random,
-                             max_text_tokens_per_segment,
-                             duration_factor,
-                             *advanced_params,
-                     ],
-                     outputs=[output_audio])
+    generation_inputs = [
+        emo_control_method, prompt_audio, input_text_single, lang_dropdown,
+        emo_upload, emo_weight,
+        vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+        emo_text, emo_random, max_text_tokens_per_segment, duration_factor,
+        *advanced_params,
+    ]
+    gen_button.click(
+        gen_single, inputs=generation_inputs, outputs=[output_audio],
+        concurrency_id="tts_generation", concurrency_limit=1,
+        api_name="generate_single",
+    )
+    batch_inputs = generation_inputs.copy()
+    batch_inputs[2] = input_text_batch
+    batch_button.click(
+        gen_batch, inputs=batch_inputs,
+        outputs=[batch_status, batch_results, batch_files, batch_archive, batch_audio],
+        concurrency_id="tts_generation", concurrency_limit=1,
+        api_name="generate_batch",
+    )
 
 
 
